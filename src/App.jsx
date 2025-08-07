@@ -1,9 +1,9 @@
 /* eslint-disable react-hooks/exhaustive-deps */
-/* eslint-disable no-unused-vars */
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useCallback, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 import { FileUp } from "lucide-react";
+import Footer from "./components/Footer";
 import {
   LineChart,
   Line,
@@ -15,67 +15,16 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
-// --- Helper Functions ---
-
-// --- Text Use Case Helpers ---
-function preprocessText(text) {
-  const cleaned = text.toLowerCase().replace(/[^a-z\s]/g, "");
-  const words = cleaned.split(/\s+/).filter(Boolean);
-  const vocab = [...new Set(words)];
-  const wordToIndex = new Map(vocab.map((word, i) => [word, i]));
-  const indexToWord = new Map(vocab.map((word, i) => [i, word]));
-  return { words, vocab, wordToIndex, indexToWord };
-}
-
-function createTextSequences(words, wordToIndex, sequenceLength) {
-  const sequences = [];
-  const nextWords = [];
-  for (let i = 0; i < words.length - sequenceLength; i++) {
-    sequences.push(words.slice(i, i + sequenceLength));
-    nextWords.push(words[i + sequenceLength]);
-  }
-  const X = sequences.map((seq) => seq.map((word) => wordToIndex.get(word)));
-  const y = nextWords.map((word) => wordToIndex.get(word));
-  return { X, y };
-}
-
-// --- Time Series Use Case Helpers ---
-function parseCSV(csvText) {
-  const lines = csvText.split("\n").filter((line) => line.trim() !== "");
-  if (lines.length < 2) return { headers: [], data: [] };
-  const headers = lines[0].split(",").map((h) => h.trim());
-  const data = lines.slice(1).map((line) => {
-    const values = line.split(",").map((v) => v.trim());
-    const row = {};
-    headers.forEach((header, i) => {
-      row[header] = values[i];
-    });
-    return row;
-  });
-  return { headers, data };
-}
-
-function normalizeData(data) {
-  const tensor = tf.tensor1d(data);
-  const min = tensor.min();
-  const max = tensor.max();
-  const normalized = tensor.sub(min).div(max.sub(min));
-  return {
-    normalizedData: normalized.arraySync(),
-    min: min.arraySync(),
-    max: max.arraySync(),
-  };
-}
-
-function createTimeSeriesSequences(data, sequenceLength) {
-  const X = [];
-  const y = [];
-  for (let i = 0; i < data.length - sequenceLength; i++) {
-    X.push(data.slice(i, i + sequenceLength));
-    y.push(data[i + sequenceLength]);
-  }
-  return { X, y };
-}
+// Import all helper functions from the new utils.js file
+import {
+  preprocessText,
+  createTextSequences,
+  parseCSV,
+  normalizeData,
+  createTimeSeriesSequences,
+  calculateRMSE,
+  calculateR2,
+} from "./utils"; // Make sure the path is correct
 
 // --- React Components ---
 const IconZap = () => (
@@ -294,6 +243,9 @@ export default function App() {
   const [csvData, setCsvData] = useState({ headers: [], data: [] });
   const [fileName, setFileName] = useState("");
   const [selectedColumn, setSelectedColumn] = useState("");
+  const [trainTestSplit, setTrainTestSplit] = useState(80); // Default 80%
+  const [evaluationResults, setEvaluationResults] = useState(null);
+  const [testChartData, setTestChartData] = useState([]);
 
   const resetStateForUseCase = (newUseCase) => {
     setUseCase(newUseCase);
@@ -307,6 +259,8 @@ export default function App() {
     setCsvData({ headers: [], data: [] });
     setFileName("");
     setSelectedColumn("");
+    setEvaluationResults(null);
+    setTestChartData([]);
   };
 
   const handleFileChange = (e) => {
@@ -357,7 +311,14 @@ export default function App() {
     } finally {
       setIsTraining(false);
     }
-  }, [useCase, params, textTrainingData, csvData, selectedColumn]);
+  }, [
+    useCase,
+    params,
+    textTrainingData,
+    csvData,
+    selectedColumn,
+    trainTestSplit,
+  ]);
 
   const trainNextWordModel = async () => {
     if (
@@ -444,9 +405,14 @@ export default function App() {
     if (csvData.data.length === 0 || !selectedColumn) {
       throw new Error("Please upload a CSV file and select a column.");
     }
+    // Reset previous results
+    setEvaluationResults(null);
+    setTestChartData([]);
+
     const series = csvData.data
       .map((row) => parseFloat(row[selectedColumn]))
       .filter((v) => !isNaN(v));
+
     if (series.length < params.sequenceLength + 1) {
       throw new Error(
         `The selected column must have at least ${
@@ -456,27 +422,40 @@ export default function App() {
     }
 
     const { normalizedData, min, max } = normalizeData(series);
-    modelMetadata.current = {
-      min,
-      max,
-      useCase: "time-series",
-      lastSequence: normalizedData.slice(-params.sequenceLength),
-    };
 
-    setMessage({
-      text: "Data normalized. Creating sequences...",
-      type: "info",
-    });
-    const { X, y } = createTimeSeriesSequences(
-      normalizedData,
+    // --- 1. SPLIT DATA ---
+    const splitIndex = Math.floor(
+      normalizedData.length * (trainTestSplit / 100)
+    );
+    const trainData = normalizedData.slice(0, splitIndex);
+    const testData = normalizedData.slice(splitIndex - params.sequenceLength); // Overlap to create first test sequence
+
+    // --- 2. CREATE SEQUENCES FOR TRAIN AND TEST ---
+    const { X: X_train, y: y_train } = createTimeSeriesSequences(
+      trainData,
+      params.sequenceLength
+    );
+    const { X: X_test, y: y_test } = createTimeSeriesSequences(
+      testData,
       params.sequenceLength
     );
 
-    const X_tensor = tf
-      .tensor2d(X)
-      .reshape([X.length, params.sequenceLength, 1]);
-    const y_tensor = tf.tensor1d(y);
+    if (X_train.length === 0 || X_test.length === 0) {
+      throw new Error(
+        "Not enough data to create train/test splits with the current sequence length. Try a smaller sequence length or larger dataset."
+      );
+    }
 
+    const X_train_tensor = tf
+      .tensor2d(X_train)
+      .reshape([X_train.length, params.sequenceLength, 1]);
+    const y_train_tensor = tf.tensor1d(y_train);
+    const X_test_tensor = tf
+      .tensor2d(X_test)
+      .reshape([X_test.length, params.sequenceLength, 1]);
+    const y_test_tensor = tf.tensor1d(y_test); // Normalized test truth
+
+    // --- 3. BUILD AND COMPILE MODEL ---
     const newModel = tf.sequential();
     newModel.add(
       tf.layers.lstm({
@@ -491,11 +470,12 @@ export default function App() {
       loss: "meanSquaredError",
     });
 
+    // --- 4. TRAIN THE MODEL (ONLY ON TRAINING DATA) ---
     setMessage({
-      text: `Model compiled. Starting training for ${params.epochs} epochs...`,
+      text: `Model compiled. Training on ${X_train.length} samples...`,
       type: "info",
     });
-    await newModel.fit(X_tensor, y_tensor, {
+    await newModel.fit(X_train_tensor, y_train_tensor, {
       epochs: params.epochs,
       callbacks: {
         onEpochEnd: (epoch, logs) => {
@@ -507,9 +487,47 @@ export default function App() {
       },
     });
 
+    // --- 5. EVALUATE THE MODEL ON TEST DATA ---
+    setMessage({
+      text: "Training complete. Evaluating on test data...",
+      type: "info",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10)); // Allow UI update
+
+    const normalizedPredictions = newModel.predict(X_test_tensor);
+
+    // --- 6. DE-NORMALIZE DATA FOR METRICS AND CHARTING ---
+    const denormalize = (tensor) => tensor.mul(max - min).add(min);
+    const y_test_denorm = denormalize(y_test_tensor);
+    const predictions_denorm = denormalize(normalizedPredictions);
+
+    const y_test_array = await y_test_denorm.array();
+    const predictions_array = await predictions_denorm.array();
+
+    // --- 7. CALCULATE METRICS AND PREPARE CHART DATA ---
+    const rmse = calculateRMSE(y_test_denorm, predictions_denorm);
+    const r2 = calculateR2(y_test_denorm, predictions_denorm);
+
+    setEvaluationResults({ rmse, r2 });
+
+    const chartData = y_test_array.map((actual, i) => ({
+      index: i,
+      actual: actual,
+      predicted: predictions_array[i],
+    }));
+    setTestChartData(chartData);
+
+    // Store metadata for the "Predict Next Value" button
+    modelMetadata.current = {
+      min,
+      max,
+      useCase: "time-series",
+      lastSequence: normalizedData.slice(-params.sequenceLength),
+    };
+
     setModel(newModel);
     setMessage({
-      text: 'Training complete! Click "Predict Next Value".',
+      text: "Evaluation complete! See test results below. You can also predict the next value.",
       type: "success",
     });
   };
@@ -581,306 +599,401 @@ export default function App() {
   };
 
   return (
-    <div className="bg-gray-50 min-h-screen font-sans text-gray-800">
-      <div className="container mx-auto p-4 md:p-8">
-        <header className="text-center mb-8">
-          <h1 className="text-4xl md:text-5xl font-bold text-gray-900">
-            LSTM Playground
-          </h1>
-          <p className="text-lg text-gray-600 mt-2">
-            Experiment with LSTMs directly in your browser.
-          </p>
-        </header>
+    <>
+      <div className="bg-gray-50 min-h-screen font-sans text-gray-800">
+        <div className="container mx-auto p-4 md:p-8">
+          <header className="text-center mb-6">
+            <h1 className="text-4xl md:text-5xl font-bold text-gray-900">
+              LSTM Playground
+            </h1>
+            <p className="text-lg text-gray-600 mt-2">
+              Experiment with LSTMs directly in your window.
+            </p>
+          </header>
 
-        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
-          <div className="mb-6 border-b pb-6">
-            <h2 className="text-2xl font-semibold text-gray-800 mb-3">
-              0. Select Use Case
-            </h2>
-            <div className="flex space-x-2 rounded-lg bg-gray-200 p-1">
-              <button
-                onClick={() => resetStateForUseCase("next-word")}
-                className={`w-full py-2 px-4 rounded-md text-sm font-medium transition-colors ${
-                  useCase === "next-word"
-                    ? "bg-white text-blue-600 shadow"
-                    : "text-gray-600 hover:bg-gray-300"
-                }`}
-              >
-                Next Word Prediction
-              </button>
-              <button
-                onClick={() => resetStateForUseCase("time-series")}
-                className={`w-full py-2 px-4 rounded-md text-sm font-medium transition-colors ${
-                  useCase === "time-series"
-                    ? "bg-white text-blue-600 shadow"
-                    : "text-gray-600 hover:bg-gray-300"
-                }`}
-              >
-                Time Series Forecasting
-              </button>
-            </div>
-          </div>
-
-          {useCase === "next-word" && (
-            <div className="mb-6">
-              <h2 className="text-2xl font-semibold flex items-center text-gray-800">
-                <IconFileText />
-                1. Training Data
+          <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+            <div className="mb-6 border-b pb-6">
+              <h2 className="text-2xl font-semibold text-gray-800 mb-3">
+                0. Select Use Case
               </h2>
-              <p className="text-sm text-gray-500 mb-3">
-                Provide the text the model will learn from.
-              </p>
-              <textarea
-                value={textTrainingData}
-                onChange={(e) => setTextTrainingData(e.target.value)}
-                disabled={isTraining}
-                className="w-full h-40 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+              <div className="flex space-x-2 rounded-lg bg-gray-200 p-1">
+                <button
+                  onClick={() => resetStateForUseCase("next-word")}
+                  className={`w-full py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+                    useCase === "next-word"
+                      ? "bg-white text-blue-600 shadow"
+                      : "text-gray-600 hover:bg-gray-300"
+                  }`}
+                >
+                  Next Word Prediction
+                </button>
+                <button
+                  onClick={() => resetStateForUseCase("time-series")}
+                  className={`w-full py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+                    useCase === "time-series"
+                      ? "bg-white text-blue-600 shadow"
+                      : "text-gray-600 hover:bg-gray-300"
+                  }`}
+                >
+                  Time Series Forecasting
+                </button>
+              </div>
+            </div>
+
+            {useCase === "next-word" && (
+              <div className="mb-6">
+                <h2 className="text-2xl font-semibold flex items-center text-gray-800">
+                  <IconFileText />
+                  1. Training Data
+                </h2>
+                <p className="text-sm text-gray-500 mb-3">
+                  Provide the text the model will learn from.
+                </p>
+                <textarea
+                  value={textTrainingData}
+                  onChange={(e) => setTextTrainingData(e.target.value)}
+                  disabled={isTraining}
+                  className="w-full h-40 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            )}
+
+            {useCase === "time-series" && (
+              <div className="mb-6">
+                <h2 className="text-2xl font-semibold flex items-center text-gray-800 space-x-2">
+                  <IconTrendingUp />
+                  <span>1. Training Data</span>
+                </h2>
+                <p className="text-sm text-gray-500 mb-3">
+                  Upload a CSV file with a header row. Select the column with
+                  numerical data to predict.
+                </p>
+
+                <div
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files[0];
+                    if (file && file.type === "text/csv") {
+                      handleFileChange({ target: { files: [file] } });
+                    }
+                  }}
+                  onDragOver={(e) => e.preventDefault()}
+                  className={`w-full h-40 flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-xl transition ${
+                    isTraining
+                      ? "cursor-not-allowed bg-gray-100"
+                      : "cursor-pointer bg-white hover:bg-gray-50"
+                  } border-gray-300 mb-4 text-center`}
+                >
+                  <FileUp className="h-8 w-8 text-gray-400 mb-2" />
+                  <p className="text-gray-600">
+                    {fileName ? (
+                      <>
+                        <strong>{fileName}</strong>
+                        <br />
+                        Drag to replace or use the button below
+                      </>
+                    ) : (
+                      <>
+                        <strong>Drag & drop</strong> your CSV file here or click
+                        below to upload
+                      </>
+                    )}
+                  </p>
+                </div>
+
+                <div className="flex items-center space-x-4">
+                  <label className="bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 px-4 border border-gray-300 rounded-lg cursor-pointer">
+                    <span>{fileName ? "Change File" : "Upload CSV"}</span>
+                    <input
+                      type="file"
+                      accept=".csv"
+                      onChange={handleFileChange}
+                      disabled={isTraining}
+                      className="hidden"
+                    />
+                  </label>
+                  {fileName && (
+                    <span className="text-gray-600">{fileName}</span>
+                  )}
+                </div>
+
+                {csvData.headers.length > 0 && (
+                  <div className="mt-4">
+                    <label
+                      htmlFor="column-select"
+                      className="block text-sm font-medium text-gray-700"
+                    >
+                      Column to Predict:
+                    </label>
+                    <select
+                      id="column-select"
+                      value={selectedColumn}
+                      onChange={(e) => setSelectedColumn(e.target.value)}
+                      disabled={isTraining}
+                      className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                    >
+                      {csvData.headers.map((h) => (
+                        <option key={h} value={h}>
+                          {h}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {csvData.headers.length > 0 && (
+                  <div className="mt-6">
+                    <label
+                      htmlFor="trainTestSplit"
+                      className="block text-sm font-medium text-gray-700"
+                    >
+                      Train/Test Split:{" "}
+                      <span className="font-bold">{trainTestSplit}% Train</span>{" "}
+                      / {100 - trainTestSplit}% Test
+                    </label>
+                    <input
+                      id="trainTestSplit"
+                      type="range"
+                      min="10"
+                      max="90"
+                      step="5"
+                      value={trainTestSplit}
+                      onChange={(e) =>
+                        setTrainTestSplit(Number(e.target.value))
+                      }
+                      disabled={isTraining}
+                      className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer mt-1"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="mb-8">
+              <h2 className="text-2xl font-semibold flex items-center text-gray-800">
+                <IconCpu />
+                2. Hyperparameters
+              </h2>
+              <HyperparameterControls
+                params={params}
+                setParams={setParams}
+                isTraining={isTraining}
+                useCase={useCase}
               />
             </div>
-          )}
 
-          {useCase === "time-series" && (
-            <div className="mb-6">
-              <h2 className="text-2xl font-semibold flex items-center text-gray-800 space-x-2">
-                <IconTrendingUp />
-                <span>1. Training Data</span>
-              </h2>
-              <p className="text-sm text-gray-500 mb-3">
-                Upload a CSV file with a header row. Select the column with
-                numerical data to predict.
-              </p>
-
-              {/* Drag and Drop Area */}
-              <div
-                onDrop={(e) => {
-                  e.preventDefault();
-                  const file = e.dataTransfer.files[0];
-                  if (file && file.type === "text/csv") {
-                    handleFileChange({ target: { files: [file] } });
-                  }
-                }}
-                onDragOver={(e) => e.preventDefault()}
-                className={`w-full h-40 flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-xl transition ${
-                  isTraining
-                    ? "cursor-not-allowed bg-gray-100"
-                    : "cursor-pointer bg-white hover:bg-gray-50"
-                } border-gray-300 mb-4 text-center`}
+            <div className="text-center mb-8">
+              <button
+                onClick={handleTrain}
+                disabled={isTraining}
+                className="bg-blue-600 text-white font-bold py-3 px-8 rounded-lg shadow-md hover:bg-blue-700 disabled:bg-gray-400 flex items-center justify-center mx-auto"
               >
-                <FileUp className="h-8 w-8 text-gray-400 mb-2" />
-                <p className="text-gray-600">
-                  {fileName ? (
-                    <>
-                      <strong>{fileName}</strong>
-                      <br />
-                      Drag to replace or use the button below
-                    </>
-                  ) : (
-                    <>
-                      <strong>Drag & drop</strong> your CSV file here or click
-                      below to upload
-                    </>
-                  )}
-                </p>
-              </div>
-
-              {/* Upload Button */}
-              <div className="flex items-center space-x-4">
-                <label className="bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 px-4 border border-gray-300 rounded-lg cursor-pointer">
-                  <span>{fileName ? "Change File" : "Upload CSV"}</span>
-                  <input
-                    type="file"
-                    accept=".csv"
-                    onChange={handleFileChange}
-                    disabled={isTraining}
-                    className="hidden"
-                  />
-                </label>
-                {fileName && <span className="text-gray-600">{fileName}</span>}
-              </div>
-
-              {/* Column Selection */}
-              {csvData.headers.length > 0 && (
-                <div className="mt-4">
-                  <label
-                    htmlFor="column-select"
-                    className="block text-sm font-medium text-gray-700"
-                  >
-                    Column to Predict:
-                  </label>
-                  <select
-                    id="column-select"
-                    value={selectedColumn}
-                    onChange={(e) => setSelectedColumn(e.target.value)}
-                    disabled={isTraining}
-                    className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
-                  >
-                    {csvData.headers.map((h) => (
-                      <option key={h} value={h}>
-                        {h}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+                {isTraining ? (
+                  <>
+                    <svg
+                      className="animate-spin -ml-1 mr-3 h-5 w-5 text-white"
+                      xmlns="http://www.w3.org/2000/svg"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      ></circle>
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                      ></path>
+                    </svg>
+                    Training...
+                  </>
+                ) : (
+                  "Train Model"
+                )}
+              </button>
             </div>
-          )}
 
-          <div className="mb-8">
-            <h2 className="text-2xl font-semibold flex items-center text-gray-800">
-              <IconCpu />
-              2. Hyperparameters
-            </h2>
-            <HyperparameterControls
-              params={params}
-              setParams={setParams}
-              isTraining={isTraining}
-              useCase={useCase}
-            />
-          </div>
+            <MessageBox message={message.text} type={message.type} />
 
-          <div className="text-center mb-8">
-            <button
-              onClick={handleTrain}
-              disabled={isTraining}
-              className="bg-blue-600 text-white font-bold py-3 px-8 rounded-lg shadow-md hover:bg-blue-700 disabled:bg-gray-400 flex items-center justify-center mx-auto"
-            >
-              {isTraining ? (
-                <>
-                  <svg
-                    className="animate-spin -ml-1 mr-3 h-5 w-5 text-white"
-                    xmlns="http://www.w3.org/2000/svg"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                  >
-                    <circle
-                      className="opacity-25"
-                      cx="12"
-                      cy="12"
-                      r="10"
-                      stroke="currentColor"
-                      strokeWidth="4"
-                    ></circle>
-                    <path
-                      className="opacity-75"
-                      fill="currentColor"
-                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                    ></path>
-                  </svg>
-                  Training...
-                </>
-              ) : (
-                "Train Model"
-              )}
-            </button>
-          </div>
-
-          <MessageBox message={message.text} type={message.type} />
-
-          {trainingLog.length > 0 && (
-            <div className="mb-8">
-              <h3 className="text-xl font-semibold text-gray-700 mb-4">
-                Training Progress
-              </h3>
-              <div className="h-64 w-full bg-gray-50 p-2 rounded-lg border">
-                <ResponsiveContainer>
-                  <LineChart
-                    data={trainingLog}
-                    margin={{ top: 5, right: 20, left: -10, bottom: 5 }}
-                  >
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="epoch" />
-                    <YAxis yAxisId="left" domain={["auto", "auto"]} />
-                    {useCase === "next-word" && (
-                      <YAxis
-                        yAxisId="right"
-                        orientation="right"
-                        domain={[0, 1]}
-                      />
-                    )}
-                    <Tooltip />
-                    <Legend />
-                    <Line
-                      yAxisId="left"
-                      type="monotone"
-                      dataKey="loss"
-                      stroke="#ef4444"
-                      strokeWidth={2}
-                      name="Loss"
-                    />
-                    {useCase === "next-word" && (
+            {trainingLog.length > 0 && (
+              <div className="mb-8">
+                <h3 className="text-xl font-semibold text-gray-700 mb-4">
+                  Training Progress
+                </h3>
+                <div className="h-64 w-full bg-gray-50 p-2 rounded-lg border">
+                  <ResponsiveContainer>
+                    <LineChart
+                      data={trainingLog}
+                      margin={{ top: 5, right: 20, left: -10, bottom: 5 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="epoch" />
+                      <YAxis yAxisId="left" domain={["auto", "auto"]} />
+                      {useCase === "next-word" && (
+                        <YAxis
+                          yAxisId="right"
+                          orientation="right"
+                          domain={[0, 1]}
+                        />
+                      )}
+                      <Tooltip />
+                      <Legend />
                       <Line
-                        yAxisId="right"
+                        yAxisId="left"
                         type="monotone"
-                        dataKey="acc"
-                        stroke="#22c55e"
+                        dataKey="loss"
+                        stroke="#ef4444"
                         strokeWidth={2}
-                        name="Accuracy"
+                        name="Loss"
                       />
-                    )}
-                  </LineChart>
-                </ResponsiveContainer>
+                      {useCase === "next-word" && (
+                        <Line
+                          yAxisId="right"
+                          type="monotone"
+                          dataKey="acc"
+                          stroke="#22c55e"
+                          strokeWidth={2}
+                          name="Accuracy"
+                        />
+                      )}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {model && !isTraining && (
-            <div className="mt-8 pt-6 border-t border-gray-200">
-              <h2 className="text-2xl font-semibold flex items-center text-gray-800">
-                <IconZap />
-                3. Prediction
-              </h2>
-              {useCase === "next-word" && (
-                <>
-                  <p className="text-sm text-gray-500 mb-3">
-                    Provide a starting sequence to predict the next word.
-                  </p>
-                  <div className="flex flex-col sm:flex-row items-center gap-4">
-                    <input
-                      type="text"
-                      value={seedText}
-                      onChange={(e) => setSeedText(e.target.value)}
-                      className="flex-grow w-full p-3 border border-gray-300 rounded-lg"
-                      placeholder="Enter seed text..."
-                    />
+            {evaluationResults && testChartData.length > 0 && (
+              <div className="mb-8">
+                <h3 className="text-xl font-semibold text-gray-700 mb-4">
+                  Test Set Evaluation
+                </h3>
+                {/* Metrics Display */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 text-center">
+                  <div className="p-4 bg-gray-100 rounded-lg">
+                    <p className="text-sm text-gray-600">RMSE</p>
+                    <p className="text-2xl font-bold text-blue-600">
+                      {evaluationResults.rmse.toFixed(4)}
+                    </p>
+                  </div>
+                  <div className="p-4 bg-gray-100 rounded-lg">
+                    <p className="text-sm text-gray-600">R-Squared (R²)</p>
+                    <p className="text-2xl font-bold text-green-600">
+                      {evaluationResults.r2.toFixed(4)}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Chart Display */}
+                <div className="h-80 w-full bg-gray-50 p-2 rounded-lg border">
+                  <ResponsiveContainer>
+                    <LineChart
+                      data={testChartData}
+                      margin={{ top: 5, right: 20, left: -10, bottom: 5 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="index"
+                        label={{
+                          value: "Test Data Point Index",
+                          position: "insideBottom",
+                          offset: -5,
+                        }}
+                      />
+                      <YAxis domain={["auto", "auto"]} />
+                      <Tooltip
+                        formatter={(value) =>
+                          typeof value === "number" ? value.toFixed(2) : value
+                        }
+                      />
+                      <Legend />
+                      <Line
+                        type="monotone"
+                        dataKey="actual"
+                        stroke="#ef4444"
+                        strokeWidth={2}
+                        name="Actual Values"
+                        dot={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="predicted"
+                        stroke="#3b82f6"
+                        strokeWidth={2}
+                        name="Predicted Values"
+                        dot={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {model && !isTraining && (
+              <div className="mt-8 pt-6 border-t border-gray-200">
+                <h2 className="text-2xl font-semibold flex items-center text-gray-800">
+                  <IconZap />
+                  3. Prediction
+                </h2>
+                {useCase === "next-word" && (
+                  <>
+                    <p className="text-sm text-gray-500 mb-3">
+                      Provide a starting sequence to predict the next word.
+                    </p>
+                    <div className="flex flex-col sm:flex-row items-center gap-4">
+                      <input
+                        type="text"
+                        value={seedText}
+                        onChange={(e) => setSeedText(e.target.value)}
+                        className="flex-grow w-full p-3 border border-gray-300 rounded-lg"
+                        placeholder="Enter seed text..."
+                      />
+                      <button
+                        onClick={handlePredict}
+                        disabled={isPredicting}
+                        className="bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 disabled:bg-gray-400 w-full sm:w-auto"
+                      >
+                        {isPredicting ? "Predicting..." : "Predict Next Word"}
+                      </button>
+                    </div>
+                  </>
+                )}
+                {useCase === "time-series" && (
+                  <div className="text-center">
+                    <p className="text-sm text-gray-500 mb-3">
+                      The model will predict the next value in the sequence
+                      based on the uploaded data.
+                    </p>
                     <button
                       onClick={handlePredict}
                       disabled={isPredicting}
-                      className="bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 disabled:bg-gray-400 w-full sm:w-auto"
+                      className="bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 disabled:bg-gray-400"
                     >
-                      {isPredicting ? "Predicting..." : "Predict Next Word"}
+                      {isPredicting ? "Predicting..." : "Predict Next Value"}
                     </button>
                   </div>
-                </>
-              )}
-              {useCase === "time-series" && (
-                <div className="text-center">
-                  <p className="text-sm text-gray-500 mb-3">
-                    The model will predict the next value in the sequence based
-                    on the uploaded data.
-                  </p>
-                  <button
-                    onClick={handlePredict}
-                    disabled={isPredicting}
-                    className="bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 disabled:bg-gray-400"
-                  >
-                    {isPredicting ? "Predicting..." : "Predict Next Value"}
-                  </button>
-                </div>
-              )}
-              {prediction && (
-                <div className="mt-4 p-4 bg-gray-100 rounded-lg text-center">
-                  <p className="text-gray-600">
-                    Predicted Next {useCase === "next-word" ? "Word" : "Value"}:
-                  </p>
-                  <p className="text-2xl font-bold text-indigo-600">
-                    {prediction}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+                {prediction && (
+                  <div className="mt-4 p-4 bg-gray-100 rounded-lg text-center">
+                    <p className="text-gray-600">
+                      Predicted Next{" "}
+                      {useCase === "next-word" ? "Word" : "Value"}:
+                    </p>
+                    <p className="text-2xl font-bold text-indigo-600">
+                      {prediction}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+      <Footer />
+    </>
   );
 }
