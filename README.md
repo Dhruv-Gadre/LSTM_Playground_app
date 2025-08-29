@@ -5,6 +5,10 @@
 - **Dhruv Gadre**
 - **Sharvari Rajurkar**
 
+
+## 📸 Preview
+![Preview Screenshot](./public/image.png)
+
 ## Usage
 
 ### Next Word Prediction
