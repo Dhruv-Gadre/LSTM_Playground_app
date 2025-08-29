@@ -1,9 +1,9 @@
 /* eslint-disable react-hooks/exhaustive-deps */
+/* eslint-disable no-unused-vars */
 
 import React, { useState, useCallback, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 import { FileUp } from "lucide-react";
-import Footer from "./components/Footer";
 import {
   LineChart,
   Line,
@@ -15,7 +15,6 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
-// Import all helper functions from the new utils.js file
 import {
   preprocessText,
   createTextSequences,
@@ -24,7 +23,9 @@ import {
   createTimeSeriesSequences,
   calculateRMSE,
   calculateR2,
-} from "./utils"; // Make sure the path is correct
+} from "./utils";
+
+import Footer from "./components/Footer";
 
 // --- React Components ---
 const IconZap = () => (
@@ -122,14 +123,16 @@ const MessageBox = ({ message, type }) => {
 };
 
 const HyperparameterControls = ({ params, setParams, isTraining, useCase }) => {
-  const { epochs, learningRate, lstmUnits, sequenceLength } = params;
+  const {
+    epochs,
+    learningRate,
+    lstmUnits,
+    sequenceLength,
+    sequenceLengthPercent,
+  } = params;
   const handleParamChange = (param, value) => {
     setParams((prev) => ({ ...prev, [param]: Number(value) }));
   };
-  const seqLenDescription =
-    useCase === "next-word"
-      ? "Number of words to consider for predicting the next one."
-      : "Number of previous time steps to use for predicting the next value.";
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -189,25 +192,56 @@ const HyperparameterControls = ({ params, setParams, isTraining, useCase }) => {
           className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
         />
       </div>
-      <div>
-        <label
-          htmlFor="sequenceLength"
-          className="block text-sm font-medium text-gray-700"
-        >
-          Sequence Length: {sequenceLength}
-        </label>
-        <input
-          id="sequenceLength"
-          type="range"
-          min="2"
-          max="50"
-          value={sequenceLength}
-          onChange={(e) => handleParamChange("sequenceLength", e.target.value)}
-          disabled={isTraining}
-          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
-        />
-        <p className="text-xs text-gray-500 mt-1">{seqLenDescription}</p>
-      </div>
+      {useCase === "time-series" ? (
+        <div>
+          <label
+            htmlFor="sequenceLengthPercent"
+            className="block text-sm font-medium text-gray-700"
+          >
+            Sequence Length: {sequenceLengthPercent}% of Training Data
+          </label>
+          <input
+            id="sequenceLengthPercent"
+            type="range"
+            min="1"
+            max="25"
+            step="1"
+            value={sequenceLengthPercent}
+            onChange={(e) =>
+              handleParamChange("sequenceLengthPercent", e.target.value)
+            }
+            disabled={isTraining}
+            className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Percentage of training data to use as the lookback window.
+          </p>
+        </div>
+      ) : (
+        <div>
+          <label
+            htmlFor="sequenceLength"
+            className="block text-sm font-medium text-gray-700"
+          >
+            Sequence Length: {sequenceLength} words
+          </label>
+          <input
+            id="sequenceLength"
+            type="range"
+            min="2"
+            max="50"
+            value={sequenceLength}
+            onChange={(e) =>
+              handleParamChange("sequenceLength", e.target.value)
+            }
+            disabled={isTraining}
+            className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Number of words to consider for predicting the next one.
+          </p>
+        </div>
+      )}
     </div>
   );
 };
@@ -220,7 +254,8 @@ export default function App() {
     epochs: 50,
     learningRate: 0.01,
     lstmUnits: 32,
-    sequenceLength: 10,
+    sequenceLength: 10, // For text
+    sequenceLengthPercent: 5, // For time series
   });
   const [model, setModel] = useState(null);
   const [isTraining, setIsTraining] = useState(false);
@@ -243,7 +278,7 @@ export default function App() {
   const [csvData, setCsvData] = useState({ headers: [], data: [] });
   const [fileName, setFileName] = useState("");
   const [selectedColumn, setSelectedColumn] = useState("");
-  const [trainTestSplit, setTrainTestSplit] = useState(80); // Default 80%
+  const [trainTestSplit, setTrainTestSplit] = useState(80);
   const [evaluationResults, setEvaluationResults] = useState(null);
   const [testChartData, setTestChartData] = useState([]);
 
@@ -272,7 +307,7 @@ export default function App() {
         const { headers, data } = parseCSV(event.target.result);
         if (headers.length > 0) {
           setCsvData({ headers, data });
-          setSelectedColumn(headers[0]); // Default to first column
+          setSelectedColumn(headers[0]);
           setMessage({
             text: `CSV loaded. Select the column to predict and train the model.`,
             type: "info",
@@ -321,14 +356,10 @@ export default function App() {
   ]);
 
   const trainNextWordModel = async () => {
-    if (
-      textTrainingData.trim().split(/\s+/).length <
-      params.sequenceLength + 1
-    ) {
+    const { sequenceLength } = params;
+    if (textTrainingData.trim().split(/\s+/).length < sequenceLength + 1) {
       throw new Error(
-        `Training data must contain at least ${
-          params.sequenceLength + 1
-        } words.`
+        `Training data must contain at least ${sequenceLength + 1} words.`
       );
     }
     const { words, vocab, wordToIndex, indexToWord } =
@@ -337,6 +368,7 @@ export default function App() {
       wordToIndex,
       indexToWord,
       vocabSize: vocab.length,
+      sequenceLength, // Store for prediction
       useCase: "next-word",
     };
 
@@ -344,13 +376,9 @@ export default function App() {
       text: `Data preprocessed. Vocab size: ${vocab.length}. Creating sequences...`,
       type: "info",
     });
-    const { X, y } = createTextSequences(
-      words,
-      wordToIndex,
-      params.sequenceLength
-    );
+    const { X, y } = createTextSequences(words, wordToIndex, sequenceLength);
 
-    const X_tensor = tf.tensor2d(X, [X.length, params.sequenceLength]);
+    const X_tensor = tf.tensor2d(X, [X.length, sequenceLength]);
     const y_tensor = tf.oneHot(tf.tensor1d(y, "int32"), vocab.length);
 
     const newModel = tf.sequential();
@@ -358,7 +386,7 @@ export default function App() {
       tf.layers.embedding({
         inputDim: vocab.length,
         outputDim: 8,
-        inputLength: params.sequenceLength,
+        inputLength: sequenceLength,
       })
     );
     newModel.add(
@@ -405,7 +433,6 @@ export default function App() {
     if (csvData.data.length === 0 || !selectedColumn) {
       throw new Error("Please upload a CSV file and select a column.");
     }
-    // Reset previous results
     setEvaluationResults(null);
     setTestChartData([]);
 
@@ -413,54 +440,66 @@ export default function App() {
       .map((row) => parseFloat(row[selectedColumn]))
       .filter((v) => !isNaN(v));
 
-    if (series.length < params.sequenceLength + 1) {
-      throw new Error(
-        `The selected column must have at least ${
-          params.sequenceLength + 1
-        } numeric values.`
-      );
-    }
-
     const { normalizedData, min, max } = normalizeData(series);
 
-    // --- 1. SPLIT DATA ---
     const splitIndex = Math.floor(
       normalizedData.length * (trainTestSplit / 100)
     );
     const trainData = normalizedData.slice(0, splitIndex);
-    const testData = normalizedData.slice(splitIndex - params.sequenceLength); // Overlap to create first test sequence
+    const testData = normalizedData.slice(splitIndex); // Note: we'll adjust this for sequencing
 
-    // --- 2. CREATE SEQUENCES FOR TRAIN AND TEST ---
+    // --- CRITICAL: Calculate sequence length AFTER splitting data ---
+    const sequenceLengthInSteps = Math.max(
+      2,
+      Math.floor(trainData.length * (params.sequenceLengthPercent / 100))
+    );
+    setMessage({
+      text: `Using sequence length of ${sequenceLengthInSteps} steps.`,
+      type: "info",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    if (series.length < sequenceLengthInSteps + 1) {
+      throw new Error(
+        `The selected column must have at least ${
+          sequenceLengthInSteps + 1
+        } numeric values to create sequences.`
+      );
+    }
+
+    const testDataWithOverlap = normalizedData.slice(
+      splitIndex - sequenceLengthInSteps
+    );
+
     const { X: X_train, y: y_train } = createTimeSeriesSequences(
       trainData,
-      params.sequenceLength
+      sequenceLengthInSteps
     );
     const { X: X_test, y: y_test } = createTimeSeriesSequences(
-      testData,
-      params.sequenceLength
+      testDataWithOverlap,
+      sequenceLengthInSteps
     );
 
     if (X_train.length === 0 || X_test.length === 0) {
       throw new Error(
-        "Not enough data to create train/test splits with the current sequence length. Try a smaller sequence length or larger dataset."
+        "Not enough data to create train/test splits. Try adjusting the train/test split or sequence length percentage."
       );
     }
 
     const X_train_tensor = tf
       .tensor2d(X_train)
-      .reshape([X_train.length, params.sequenceLength, 1]);
+      .reshape([X_train.length, sequenceLengthInSteps, 1]);
     const y_train_tensor = tf.tensor1d(y_train);
     const X_test_tensor = tf
       .tensor2d(X_test)
-      .reshape([X_test.length, params.sequenceLength, 1]);
-    const y_test_tensor = tf.tensor1d(y_test); // Normalized test truth
+      .reshape([X_test.length, sequenceLengthInSteps, 1]);
+    const y_test_tensor = tf.tensor1d(y_test);
 
-    // --- 3. BUILD AND COMPILE MODEL ---
     const newModel = tf.sequential();
     newModel.add(
       tf.layers.lstm({
         units: params.lstmUnits,
-        inputShape: [params.sequenceLength, 1],
+        inputShape: [sequenceLengthInSteps, 1],
       })
     );
     newModel.add(tf.layers.dense({ units: 1 }));
@@ -470,7 +509,6 @@ export default function App() {
       loss: "meanSquaredError",
     });
 
-    // --- 4. TRAIN THE MODEL (ONLY ON TRAINING DATA) ---
     setMessage({
       text: `Model compiled. Training on ${X_train.length} samples...`,
       type: "info",
@@ -487,16 +525,14 @@ export default function App() {
       },
     });
 
-    // --- 5. EVALUATE THE MODEL ON TEST DATA ---
     setMessage({
       text: "Training complete. Evaluating on test data...",
       type: "info",
     });
-    await new Promise((resolve) => setTimeout(resolve, 10)); // Allow UI update
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
     const normalizedPredictions = newModel.predict(X_test_tensor);
 
-    // --- 6. DE-NORMALIZE DATA FOR METRICS AND CHARTING ---
     const denormalize = (tensor) => tensor.mul(max - min).add(min);
     const y_test_denorm = denormalize(y_test_tensor);
     const predictions_denorm = denormalize(normalizedPredictions);
@@ -504,7 +540,6 @@ export default function App() {
     const y_test_array = await y_test_denorm.array();
     const predictions_array = await predictions_denorm.array();
 
-    // --- 7. CALCULATE METRICS AND PREPARE CHART DATA ---
     const rmse = calculateRMSE(y_test_denorm, predictions_denorm);
     const r2 = calculateR2(y_test_denorm, predictions_denorm);
 
@@ -517,12 +552,12 @@ export default function App() {
     }));
     setTestChartData(chartData);
 
-    // Store metadata for the "Predict Next Value" button
     modelMetadata.current = {
       min,
       max,
       useCase: "time-series",
-      lastSequence: normalizedData.slice(-params.sequenceLength),
+      sequenceLength: sequenceLengthInSteps, // Store the calculated steps
+      lastSequence: normalizedData.slice(-sequenceLengthInSteps),
     };
 
     setModel(newModel);
@@ -554,38 +589,36 @@ export default function App() {
     } finally {
       setIsPredicting(false);
     }
-  }, [model, seedText, params.sequenceLength]);
+  }, [model, seedText]);
 
   const predictNextWord = async () => {
-    const { wordToIndex, indexToWord } = modelMetadata.current;
+    const { wordToIndex, indexToWord, sequenceLength } = modelMetadata.current;
     let inputWords = seedText
       .toLowerCase()
       .replace(/[^a-z\s]/g, "")
       .split(/\s+/)
       .filter(Boolean);
-    if (inputWords.length < params.sequenceLength) {
-      throw new Error(
-        `Seed text must have at least ${params.sequenceLength} words.`
-      );
+    if (inputWords.length < sequenceLength) {
+      throw new Error(`Seed text must have at least ${sequenceLength} words.`);
     }
-    inputWords = inputWords.slice(-params.sequenceLength);
+    inputWords = inputWords.slice(-sequenceLength);
     const inputIndices = inputWords.map((word) => wordToIndex.get(word));
     if (inputIndices.some((idx) => idx === undefined)) {
       throw new Error(
         "Seed text contains words not in the training vocabulary."
       );
     }
-    const inputTensor = tf.tensor2d([inputIndices], [1, params.sequenceLength]);
+    const inputTensor = tf.tensor2d([inputIndices], [1, sequenceLength]);
     const predictionTensor = model.predict(inputTensor);
     const predictedIndex = await predictionTensor.argMax(-1).data();
     setPrediction(indexToWord.get(predictedIndex[0]));
   };
 
   const predictNextValue = async () => {
-    const { min, max, lastSequence } = modelMetadata.current;
+    const { min, max, lastSequence, sequenceLength } = modelMetadata.current;
     const inputTensor = tf
       .tensor2d([lastSequence])
-      .reshape([1, params.sequenceLength, 1]);
+      .reshape([1, sequenceLength, 1]);
     const predictionTensor = model.predict(inputTensor);
     const normalizedPred = await predictionTensor.data();
 
@@ -599,10 +632,10 @@ export default function App() {
   };
 
   return (
-    <>
-      <div className="bg-gray-50 min-h-screen font-sans text-gray-800">
+    <div className="bg-gray-50 min-h-screen font-sans text-gray-800 flex flex-col">
+      <div className="flex-grow">
         <div className="container mx-auto p-4 md:p-8">
-          <header className="text-center mb-6">
+          <header className="text-center mb-8">
             <h1 className="text-4xl md:text-5xl font-bold text-gray-900">
               LSTM Playground
             </h1>
@@ -612,6 +645,7 @@ export default function App() {
           </header>
 
           <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+            {/* All app content goes here */}
             <div className="mb-6 border-b pb-6">
               <h2 className="text-2xl font-semibold text-gray-800 mb-3">
                 0. Select Use Case
@@ -872,23 +906,21 @@ export default function App() {
                 <h3 className="text-xl font-semibold text-gray-700 mb-4">
                   Test Set Evaluation
                 </h3>
-                {/* Metrics Display */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 text-center">
+                <div className=" mb-4 text-center">
                   <div className="p-4 bg-gray-100 rounded-lg">
                     <p className="text-sm text-gray-600">RMSE</p>
                     <p className="text-2xl font-bold text-blue-600">
                       {evaluationResults.rmse.toFixed(4)}
                     </p>
                   </div>
-                  <div className="p-4 bg-gray-100 rounded-lg">
+                  {/* <div className="p-4 bg-gray-100 rounded-lg">
                     <p className="text-sm text-gray-600">R-Squared (R²)</p>
                     <p className="text-2xl font-bold text-green-600">
                       {evaluationResults.r2.toFixed(4)}
                     </p>
-                  </div>
+                  </div> */}
                 </div>
 
-                {/* Chart Display */}
                 <div className="h-80 w-full bg-gray-50 p-2 rounded-lg border">
                   <ResponsiveContainer>
                     <LineChart
@@ -994,6 +1026,6 @@ export default function App() {
         </div>
       </div>
       <Footer />
-    </>
+    </div>
   );
 }
